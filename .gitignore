@@ -2,3 +2,4 @@
 venv
 blaze_face_short_range.tflite
 known_faces
+__pycache__
