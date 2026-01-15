@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 import re
@@ -118,43 +119,61 @@ def process_frame(raw_frame: np.ndarray) -> bytes:
 async def websocket_endpoint(websocket: WebSocket, cam_id: str):
     await websocket.accept()
 
-    # 1. Look up the URL in your hashmap
-    target_url = DROIDCAM_URL[cam_id]
+    target_url = DROIDCAM_URL.get(cam_id)
     if not target_url:
-        await websocket.close(code=1008)  # Policy Violation if ID is invalid
+        await websocket.close(code=1008)
         return
+
+    SKIP_I = 10
+    frame_count = 0
+    buffer = b""
 
     async with httpx.AsyncClient() as client:
         try:
             async with client.stream("GET", target_url, timeout=None) as response:
-                buffer = b""
                 async for chunk in response.aiter_bytes():
                     buffer += chunk
 
-                    # 2. Extract JPEG frames (using your logic from before)
-                    if b"--dcmjpeg" in buffer:
-                        header_end = buffer.find(b"\r\n\r\n")
-                        if header_end == -1: continue
+                    # 1. Find JPEG markers
+                    start = buffer.find(b'\xff\xd8')
+                    end = buffer.find(b'\xff\xd9')
 
-                        match = re.search(r"Content-Length:\s*(\d+)", buffer[:header_end].decode('utf-8', 'ignore'))
-                        if match:
-                            length = int(match.group(1))
-                            start, end = header_end + 4, header_end + 4 + length
+                    # 2. Check if BOTH markers exist and end is after start
+                    if start != -1 and end != -1 and end > start:
+                        # Extract data
+                        jpg_data = buffer[start:end + 2]
 
-                            if len(buffer) >= end:
-                                jpg_data = buffer[start:end]
-                                buffer = buffer[end:]
+                        # Advance buffer: Remove processed frame AND any preceding noise
+                        buffer = buffer[end + 2:]
 
-                                # 3. Process and Send via WebSocket
-                                nparr = np.frombuffer(jpg_data, np.uint8)
+                        # 3. SAFETY CHECK: Ensure jpg_data is not empty before decoding
+                        if not jpg_data:
+                            continue
+
+                        frame_count += 1
+
+                        if frame_count % SKIP_I == 0:
+                            nparr = np.frombuffer(jpg_data, np.uint8)
+
+                            # Additional check on nparr size
+                            if nparr.size > 0:
                                 frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
                                 if frame is not None:
                                     processed_bytes = process_frame(frame)
-                                    # Send raw binary data over WebSocket
-                                    await websocket.send_bytes(processed_bytes)
+                                    if processed_bytes:
+                                        await websocket.send_bytes(processed_bytes)
+                                        await asyncio.sleep(0.01)
+
+                    # 4. Emergency Buffer Clear:
+                    # If buffer gets too large without finding a frame (e.g., 5MB), clear it.
+                    if len(buffer) > 5 * 1024 * 1024:
+                        buffer = b""
 
         except WebSocketDisconnect:
             print(f"Client disconnected from {cam_id}")
         except Exception as e:
-            print(f"Streaming error on {cam_id}: {e}")
+            # This catch-all prevents the loop from crashing the whole socket
+            print(f"Caught handled error on {cam_id}: {e}")
+            # Optional: continue instead of re-raising to keep the socket alive
+            pass
