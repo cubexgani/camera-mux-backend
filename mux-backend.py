@@ -1,15 +1,13 @@
-import os
-
-import httpx
-import cv2
-import numpy as np
-import re
-from fastapi import FastAPI, Path
-from typing import Annotated
-from fastapi.responses import StreamingResponse
 import logging
-import mediapipe as mp
+import os
+import re
+
+import cv2
 import face_recognition
+import httpx
+import mediapipe as mp
+import numpy as np
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
 # from fastapi.middleware.cors import CORSMiddleware
 
@@ -32,8 +30,8 @@ logger = logging.getLogger(__name__)
 # )
 
 DROIDCAM_URL = {
-    'camera1': "http://10.64.170.248:4747/video",
-    'camera2': "http://10.64.170.163:81/stream"
+    'camera2': "http://192.168.0.183:4747/video",
+    'camera1': "http://192.168.0.181:81/stream"
 }
 
 SKIP = 3
@@ -116,53 +114,47 @@ def process_frame(raw_frame: np.ndarray) -> bytes:
     return encoded_img.tobytes()
 
 
-async def frame_generator(cam_id):
-    global frame_count
+@app.websocket("/ws/stream/{cam_id}")
+async def websocket_endpoint(websocket: WebSocket, cam_id: str):
+    await websocket.accept()
+
+    # 1. Look up the URL in your hashmap
+    target_url = DROIDCAM_URL[cam_id]
+    if not target_url:
+        await websocket.close(code=1008)  # Policy Violation if ID is invalid
+        return
+
     async with httpx.AsyncClient() as client:
-        async with client.stream("GET", DROIDCAM_URL[cam_id]) as response:
-            buffer = b""
-            async for chunk in response.aiter_bytes():
-                buffer += chunk
+        try:
+            async with client.stream("GET", target_url, timeout=None) as response:
+                buffer = b""
+                async for chunk in response.aiter_bytes():
+                    buffer += chunk
 
-                # Logic to find the frame boundary
-                if b"--dcmjpeg" in buffer:
-                    header_end = buffer.find(b"\r\n\r\n")
-                    if header_end == -1:
-                        continue
+                    # 2. Extract JPEG frames (using your logic from before)
+                    if b"--dcmjpeg" in buffer:
+                        header_end = buffer.find(b"\r\n\r\n")
+                        if header_end == -1: continue
 
-                    header_section = buffer[:header_end].decode('utf-8', errors='ignore')
-                    content_length_match = re.search(r"Content-Length:\s*(\d+)", header_section)
+                        match = re.search(r"Content-Length:\s*(\d+)", buffer[:header_end].decode('utf-8', 'ignore'))
+                        if match:
+                            length = int(match.group(1))
+                            start, end = header_end + 4, header_end + 4 + length
 
-                    if content_length_match:
-                        content_length = int(content_length_match.group(1))
-                        start_of_data = header_end + 4
-                        end_of_data = start_of_data + content_length
+                            if len(buffer) >= end:
+                                jpg_data = buffer[start:end]
+                                buffer = buffer[end:]
 
-                        if len(buffer) >= end_of_data:
-                            # Extract raw bytes
-                            jpg_data = buffer[start_of_data:end_of_data]
-                            buffer = buffer[end_of_data:]
+                                # 3. Process and Send via WebSocket
+                                nparr = np.frombuffer(jpg_data, np.uint8)
+                                frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
-                            # Decode bytes to OpenCV Mat
-                            nparr = np.frombuffer(jpg_data, np.uint8)
-                            frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                                if frame is not None:
+                                    processed_bytes = process_frame(frame)
+                                    # Send raw binary data over WebSocket
+                                    await websocket.send_bytes(processed_bytes)
 
-                            if frame is not None:
-                                # --- CALL EXTERNAL PROCESSING FUNCTION ---
-                                processed_bytes = process_frame(frame)
-
-                                if processed_bytes:
-                                    yield (b'--dcmjpeg\r\n'
-                                           b'Content-Type: image/jpeg\r\n\r\n' +
-                                           processed_bytes + b'\r\n')
-                            frame_count = (frame_count + 1) % SKIP
-                    else:
-                        buffer = buffer[header_end + 4:]
-
-
-@app.get("/stream/{cam_id}")
-async def video_feed(cam_id: Annotated[str, Path(title="The ID of the camera to view")]):
-    return StreamingResponse(
-        frame_generator(cam_id),
-        media_type="multipart/x-mixed-replace; boundary=dcmjpeg"
-    )
+        except WebSocketDisconnect:
+            print(f"Client disconnected from {cam_id}")
+        except Exception as e:
+            print(f"Streaming error on {cam_id}: {e}")
